@@ -29,6 +29,22 @@
       ]
     },
     {
+      "id": "codex-native-matrix-selector",
+      "name": "Codex Model Matrix",
+      "description": "紧凑且适配主题的 Codex 模型选择器，配备可拖动吸附的推理强度滑块。 A compact theme-aware Codex model selector with a snap-drag reasoning slider.",
+      "version": "1.0.0",
+      "author": "lx",
+      "tags": [
+        "codex",
+        "models",
+        "reasoning",
+        "ui"
+      ],
+      "homepage": "https://github.com/Xiazhixuan119748/Codex-Model-Matrix",
+      "script_url": "https://raw.githubusercontent.com/BigPizzaV3/CodexPlusPlusScriptMarket/main/scripts/Codex%20Model%20Matrix.js",
+      "sha256": "01e05efec088df6c3eb7e6c1538fe2a685d402515130a854fb457532529b9d9d"
+    },
+    {
       "id": "codex-context-used-meter",
       "name": "Codex Context Used Meter",
       "description": "在 Codex App 对话界面显示当前会话上下文余量，并支持可选 Provider 余额、消耗动画、悬停历史图、inline/floating 显示和主题切换。",
@@ -251,22 +267,6 @@
       "homepage": "https://github.com/BigPizzaV3/CodexPlusPlusScriptMarket",
       "script_url": "https://raw.githubusercontent.com/BigPizzaV3/CodexPlusPlusScriptMarket/main/scripts/prompt-optimize.js",
       "sha256": "71c5a6d873436b5cadd5c673978d3d89b9586f02ba68fac71d42d47d90902521"
-    },
-    {
-      "id": "codex-native-matrix-selector",
-      "name": "Codex Native Matrix Selector",
-      "description": "A theme-aware model and reasoning matrix backed by Codex's native selector data and handlers.",
-      "version": "0.8.0",
-      "author": "Codex",
-      "tags": [
-        "codex",
-        "models",
-        "reasoning",
-        "ui"
-      ],
-      "homepage": "",
-      "script_url": "https://raw.githubusercontent.com/BigPizzaV3/CodexPlusPlusScriptMarket/main/scripts/Codex%20Model%20Matrix.js",
-      "sha256": "0a25838a887699f8c8b72efc67f64d9df045697f6e1555b856fb10a9baa8f075"
     },
     {
       "id": "codex-plugin-translator",
