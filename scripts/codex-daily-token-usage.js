@@ -190,7 +190,7 @@
   let appServicesPromise = null;
   let domToolScanTimer = null;
   const modelByConversationKey = new Map();
-  const resizeObservedNodes = new Set();
+  const resizeObservedNodes = new WeakSet();
   const captureCleanups = new Set();
   const captureReaders = new Set();
 
@@ -3457,8 +3457,6 @@
         if (typeof response?.text === "string") return response.text;
       }
     } catch (error) {
-      // 大文件不能再通过无 maxBytes 的旧接口全量重读。
-      if (/maxBytes|too large|size limit|exceed|大小上限/i.test(String(error?.message || error))) throw error;
       workspaceError = error;
     }
 
@@ -5160,15 +5158,10 @@
   }
 
   function updateLayoutResizeObservers(obstacleEntries = []) {
-    const nodes = new Set([document.body, findAppHeaderElement(), document.getElementById(CODEX_PLUS_MENU_ID),
-      ...obstacleEntries.map((entry) => entry.node)].filter(Boolean));
-    for (const node of resizeObservedNodes) {
-      if (!nodes.has(node)) {
-        resizeObserver?.unobserve(node);
-        resizeObservedNodes.delete(node);
-      }
-    }
-    for (const node of nodes) observeLayoutNode(node);
+    observeLayoutNode(document.body);
+    observeLayoutNode(findAppHeaderElement());
+    observeLayoutNode(document.getElementById(CODEX_PLUS_MENU_ID));
+    for (const entry of obstacleEntries) observeLayoutNode(entry.node);
   }
 
   function handleWindowResize() {
@@ -5530,7 +5523,6 @@
     }
     observer?.disconnect();
     resizeObserver?.disconnect();
-    resizeObservedNodes.clear();
     restoreStandaloneCapture();
     window.removeEventListener("codex-message-from-view", handleViewMessage, true);
     window.removeEventListener("message", handleHostMessage, true);
@@ -5659,8 +5651,7 @@
     mountRoot();
     refresh();
 
-    observer = new MutationObserver((records) => {
-      if (records.every(({ target }) => root?.contains(target) || panel?.contains(target) || target === style)) return;
+    observer = new MutationObserver(() => {
       scheduleMountRoot();
       scheduleDomToolScan();
     });

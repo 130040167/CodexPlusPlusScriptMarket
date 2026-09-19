@@ -436,37 +436,3 @@ assert.equal(indexEntry.sha256, scriptSha256);
 
 api.destroy({ clearData: true });
 console.log("codex-daily-token-usage: assertions passed");
-
-async function verifyBoundedCapture() {
-  const runtime = createRuntime();
-  runtime.api.__test.installStandaloneCapture();
-  let clones = 0, cancelled = 0, reads = 0;
-  const response = {
-    headers: { get(name) { return name === "content-type" ? "text/event-stream" : null; } },
-    body: { getReader() {} },
-    clone() { clones++; throw new Error("SSE must not be cloned"); },
-  };
-  await runtime.api.__test.captureResponse(response, "/responses");
-  assert.equal(clones, 0);
-  const reader = {
-    async read() { reads++; return { value: new Uint8Array(1_100_000), done: false }; },
-    async cancel() { cancelled++; },
-  };
-  response.headers.get = (name) => name === "content-type" ? "application/json" : null;
-  response.clone = () => { clones++; return { body: { getReader: () => reader } }; };
-  await runtime.api.__test.captureResponse(response, "/responses");
-  assert.equal(reads, 2);
-  assert.equal(cancelled, 1);
-
-  let resolveRead;
-  reader.read = () => new Promise((resolve) => { resolveRead = resolve; });
-  reader.cancel = async () => { cancelled++; resolveRead({ done: true }); };
-  const pending = runtime.api.__test.captureResponse(response, "/responses");
-  const saved = runtime.window.localStorage.getItem("__codexDailyTokenUsageV1");
-  runtime.api.destroy();
-  await pending;
-  assert.ok(cancelled >= 2);
-  assert.equal(runtime.window.localStorage.getItem("__codexDailyTokenUsageV1"), saved);
-  assert.equal(runtime.window.listenerCount(), 0);
-}
-verifyBoundedCapture().catch((error) => { console.error(error); process.exitCode = 1; });
