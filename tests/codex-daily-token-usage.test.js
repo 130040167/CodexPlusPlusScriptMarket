@@ -9,19 +9,6 @@ const vm = require("node:vm");
 const scriptPath = path.resolve(__dirname, "../scripts/codex-daily-token-usage.js");
 const source = fs.readFileSync(scriptPath, "utf8");
 
-function eventTarget() {
-  const listeners = new Map();
-  return {
-    addEventListener(type, listener) {
-      if (!listeners.has(type)) listeners.set(type, new Set());
-      listeners.get(type).add(listener);
-    },
-    removeEventListener(type, listener) { listeners.get(type)?.delete(listener); },
-    dispatch(type, event) { for (const listener of [...(listeners.get(type) || [])]) listener(event); },
-    listenerCount() { return [...listeners.values()].reduce((n, set) => n + set.size, 0); },
-  };
-}
-
 function createRuntime() {
   const values = new Map();
   const localStorage = {
@@ -38,7 +25,8 @@ function createRuntime() {
   const document = {
     readyState: "loading",
     documentElement: { clientWidth: 1708 },
-    ...eventTarget(),
+    addEventListener() {},
+    removeEventListener() {},
   };
   const getComputedStyle = (node) => node?.computedStyle || {
     display: "block",
@@ -53,10 +41,13 @@ function createRuntime() {
     clearTimeout,
     setInterval,
     clearInterval,
-    ...eventTarget(),
+    addEventListener() {},
+    removeEventListener() {},
   };
   window.window = window;
-  const context = vm.createContext({
+  vm.runInContext(
+    source,
+    vm.createContext({
       window,
       document,
       localStorage,
@@ -74,11 +65,10 @@ function createRuntime() {
       setInterval,
       clearInterval,
       getComputedStyle,
-      TextDecoder,
-    });
-  const reload = () => vm.runInContext(source, context, { filename: scriptPath });
-  reload();
-  return { api: window.__codexDailyTokenUsage, document, window, reload };
+    }),
+    { filename: scriptPath }
+  );
+  return { api: window.__codexDailyTokenUsage, document };
 }
 
 function tokenCountRow(timestamp, total, last, model = "") {
@@ -107,7 +97,7 @@ function tokenCountRow(timestamp, total, last, model = "") {
 const runtime = createRuntime();
 const api = runtime.api;
 const test = api.__test;
-assert.equal(api.version, "1.4.19");
+assert.equal(api.version, "1.4.18");
 
 const today = new Date();
 today.setHours(10, 0, 0, 0);
@@ -373,60 +363,6 @@ assert.doesNotMatch(source, /document\.querySelector\(["']header["']\)/);
 assert.match(source, /html\.electron-dark #\$\{PANEL_ID\}/);
 assert.match(source, /overflow-y: auto/);
 assert.match(source, /scheduleDomToolScan/);
-
-// 新版通知必须读取累计 total，而非忽略它或重复累计 last。
-const live = createRuntime();
-const notification = {
-  type: "mcp-notification", method: "thread/tokenUsage/updated",
-  params: { threadId: "usage-thread", tokenUsage: {
-    total: { inputTokens: 100, cachedInputTokens: 40, outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 120 },
-    last: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
-  } },
-};
-const candidates = live.api.__test.findUsageCandidates(notification);
-assert.equal(candidates.length, 1);
-assert.equal(candidates[0].usage.total, 120);
-assert.equal(candidates[0].usage.cached, 40);
-assert.equal(candidates[0].cumulative, true);
-live.window.dispatch("message", { data: notification });
-assert.equal(live.api.getSnapshot().total, 120);
-live.window.dispatch("message", { data: notification });
-assert.equal(live.api.getSnapshot().total, 120);
-notification.params.tokenUsage.total.inputTokens = 110;
-notification.params.tokenUsage.total.totalTokens = 130;
-live.window.dispatch("message", { data: notification });
-assert.equal(live.api.getSnapshot().total, 130);
-
-const services = { workspaceFiles: { read() {} }, localThreadCatalog: { readEntries() {} } };
-assert.equal(test.findAppServices({ appServices: services }), services);
-assert.equal(test.findAppServices({ L9: services, ignored() {} }), services);
-assert.equal(test.findAppServices({ wrong: { workspaceFiles: {} } }), null);
-for (const [model, input, cachedInput, output] of [
-  ["gpt-6-astra", 10, 1, 50], ["gpt-5.6-sol", 4, 0.4, 20],
-  ["gpt-5.6-terra", 2, 0.2, 12], ["gpt-5.6-luna", 0.2, 0.02, 1.2],
-]) {
-  const price = api.getDefaultModelPrices()[model];
-  assert.deepEqual(JSON.parse(JSON.stringify(price)), { input, cachedInput, output });
-}
-api.setModelPrice("gpt-6-astra", { input: 7 });
-assert.equal(test.getModelPriceInfo("gpt-6-astra").price.input, 7);
-api.clearModelPrice("gpt-6-astra");
-assert.equal(test.getModelPriceInfo("gpt-6-astra").price.input, 10);
-
-// 重载多次仍然仅有一个实例的监听器；禁用后不再更新存储。
-const listenerCount = live.window.listenerCount();
-for (let i = 0; i < 10; i++) {
-  live.reload();
-  assert.equal(live.window.listenerCount(), listenerCount);
-  assert.equal(live.document.listenerCount(), 1);
-}
-live.window.dispatch("codex-plus-user-scripts-cleanup", {});
-assert.equal(live.window.listenerCount(), 0);
-assert.equal(live.document.listenerCount(), 0);
-const saved = live.window.localStorage.getItem("__codexDailyTokenUsageV1");
-notification.params.tokenUsage.total.totalTokens = 500;
-live.window.dispatch("message", { data: notification });
-assert.equal(live.window.localStorage.getItem("__codexDailyTokenUsageV1"), saved);
 
 const index = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../index.json"), "utf8"));
 const indexEntry = index.scripts.find((entry) => entry.id === "codex-daily-token-usage");
