@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Daily Token Usage
 // @namespace    codex-plus-plus
-// @version      1.4.18
+// @version      1.4.19
 // @description  每日 Token 统计，近 5 日滚动存储，优先复用已有采集，必要时回填本机历史 session，支持 Model 价格、成本估算、日期切换、5 日趋势与分享图。
 // @match        app://-/*
 // @run-at       document-start
@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "1.4.18";
+  const VERSION = "1.4.19";
   const API_KEY = "__codexDailyTokenUsage";
   const SOURCE_API_KEY = "__codexTokenUsage";
   const STORAGE_KEY = "__codexDailyTokenUsageV1";
@@ -41,11 +41,11 @@
   const HISTORY_BACKFILL_INTERVAL_MS = 10 * 60 * 1000;
   const HISTORY_THREAD_SCAN_LIMIT = 200;
   const HISTORY_THREAD_PAGE_LIMIT = 100;
-  const HISTORY_READ_CONCURRENCY = 2;
+  const HISTORY_READ_CONCURRENCY = 1;
   const HISTORY_ASSET_SCAN_LIMIT = 8;
   const HISTORY_ASSET_SCAN_MAX_CHARS = 1_200_000;
   const HISTORY_REQUEST_TIMEOUT_MS = 20000;
-  const HISTORY_MAX_SESSION_BYTES = 128 * 1024 * 1024;
+  const HISTORY_MAX_SESSION_BYTES = 16 * 1024 * 1024;
   const HISTORY_THREAD_SOURCE_KINDS = Object.freeze([
     "cli",
     "vscode",
@@ -64,9 +64,11 @@
   const PRICE_FIELDS = ["input", "cachedInput", "output", "reasoning"];
   const DEFAULT_OPENAI_PRICE_SOURCE = "OpenAI API Pricing · Standard · USD / 1M tokens";
   const DEFAULT_OPENAI_MODEL_PRICES = Object.freeze({
-    "gpt-5.6-sol": { input: 5, cachedInput: 0.5, output: 30 },
-    "gpt-5.6-terra": { input: 2.5, cachedInput: 0.25, output: 15 },
-    "gpt-5.6-luna": { input: 1, cachedInput: 0.1, output: 6 },
+    // https://developers.openai.com/api/docs/pricing — 2026-09-20, Standard.
+    "gpt-6-astra": { input: 10, cachedInput: 1, output: 50 },
+    "gpt-5.6-sol": { input: 4, cachedInput: 0.4, output: 20 },
+    "gpt-5.6-terra": { input: 2, cachedInput: 0.2, output: 12 },
+    "gpt-5.6-luna": { input: 0.2, cachedInput: 0.02, output: 1.2 },
     "gpt-5.5": { input: 5, cachedInput: 0.5, output: 30 },
     "gpt-5.5-pro": { input: 30, output: 180 },
     "gpt-5.4": { input: 2.5, cachedInput: 0.25, output: 15 },
@@ -189,6 +191,22 @@
   let domToolScanTimer = null;
   const modelByConversationKey = new Map();
   const resizeObservedNodes = new WeakSet();
+  const captureCleanups = new Set();
+  const captureReaders = new Set();
+
+  function listenForCapture(target, type, handler, once = false) {
+    const cleanup = () => {
+      target.removeEventListener?.(type, listener, true);
+      captureCleanups.delete(cleanup);
+    };
+    const listener = (event) => {
+      if (once) cleanup();
+      if (!destroyed && captureInstalled) handler(event);
+    };
+    target.addEventListener?.(type, listener, true);
+    captureCleanups.add(cleanup);
+    return cleanup;
+  }
 
   function toCount(value) {
     const number = Number(value);
@@ -523,6 +541,9 @@
     const updatedAt = Number.isFinite(timestamp) ? timestamp : Date.now();
     for (const key of conversationKeyVariants(conversationKey)) {
       modelByConversationKey.set(key, { model: normalized, confidence, updatedAt });
+    }
+    while (modelByConversationKey.size > HISTORY_THREAD_SCAN_LIMIT * RETAIN_DAYS) {
+      modelByConversationKey.delete(modelByConversationKey.keys().next().value);
     }
     return true;
   }
@@ -2068,6 +2089,16 @@
     const id = extractCandidateId(value) || inheritedId;
     const model = extractDirectModel(value) || inheritedModel;
     const candidates = [];
+    // 新版 app-server 将累计值放在 tokenUsage.total；last 只是最后一次请求，不能重复相加。
+    if (value.method === "thread/tokenUsage/updated" || value.type === "thread/tokenUsage/updated") {
+      const params = value.params || value;
+      const usage = normalizeCaptureUsage(params.tokenUsage?.total);
+      const conversationKey = extractConversationKey(params) || id;
+      if (usage && conversationKey) {
+        return [{ usage, id: conversationKey, model, cumulative: true, conversationKey,
+          timestamp: parseTimestamp(value.timestamp || params.timestamp) }];
+      }
+    }
     const tokenCountInfo = value.type === "token_count" && value.info && typeof value.info === "object"
       ? value.info
       : value.payload?.type === "token_count" && value.payload?.info && typeof value.payload.info === "object"
@@ -2581,6 +2612,7 @@
   }
 
   function processCapturePayload(payload, source, url = "") {
+    if (destroyed) return false;
     const toolChanged = processToolCallPayload(payload, source);
     if (sourceMode === "external") return toolChanged;
     processModelPayload(payload, false);
@@ -2603,6 +2635,7 @@
   }
 
   function processModelPayload(payload, recordTools = true) {
+    if (destroyed) return false;
     const toolChanged = recordTools ? processToolCallPayload(payload, "model") : false;
     if (!payload) return toolChanged;
     if (typeof payload === "string") {
@@ -2621,36 +2654,59 @@
     return observed || toolChanged;
   }
 
+  function handleViewMessage(event) {
+    try {
+      if (shouldProcessStandalonePayload()) processCapturePayload(event.detail, "codex-message");
+      else processModelPayload(event.detail);
+    } catch {
+      // 不影响 Codex 自身消息投递。
+    }
+  }
+
+  function handleHostMessage(event) {
+    try {
+      if (shouldProcessStandalonePayload()) processCapturePayload(event.data, "post-message");
+      else processModelPayload(event.data);
+    } catch {
+      // Ignore unrelated messages.
+    }
+  }
+
   function installModelCapture() {
     if (modelCaptureInstalled) return false;
-    window.addEventListener?.(
-      "codex-message-from-view",
-      (event) => {
-        try {
-          if (shouldProcessStandalonePayload()) {
-            processCapturePayload(event.detail, "codex-message");
-          } else {
-            processModelPayload(event.detail);
-          }
-        } catch {
-          // 不影响 Codex 自身消息投递。
-        }
-      },
-      true
-    );
-    window.addEventListener?.(
-      "message",
-      (event) => {
-        try {
-          processModelPayload(event.data);
-        } catch {
-          // Ignore unrelated messages.
-        }
-      },
-      true
-    );
+    window.addEventListener?.("codex-message-from-view", handleViewMessage, true);
+    window.addEventListener?.("message", handleHostMessage, true);
     modelCaptureInstalled = true;
     return true;
+  }
+
+  async function captureResponse(response, url) {
+    // 不克隆无限 SSE 流；只读取有界 JSON/text，避免 tee 缓存长期积累。
+    const type = String(response?.headers?.get?.("content-type") || "");
+    if (destroyed || !captureInstalled || !/json|text/.test(type) || /event-stream/.test(type)) return;
+    if (Number(response.headers?.get?.("content-length")) > MAX_CAPTURE_BODY_CHARS) return;
+    if (!response.clone || !response.body?.getReader || captureReaders.size >= HISTORY_READ_CONCURRENCY) return;
+    const reader = response.clone().body.getReader();
+    captureReaders.add(reader);
+    const timeout = window.setTimeout(() => { void reader.cancel().catch(() => {}); }, HISTORY_REQUEST_TIMEOUT_MS);
+    const decoder = new TextDecoder();
+    let text = "", bytes = 0;
+    try {
+      while (!destroyed && captureInstalled) {
+        const { done, value } = await reader.read();
+        if (done) {
+          processCapturePayload(text + decoder.decode(), "fetch", url);
+          break;
+        }
+        bytes += value.byteLength;
+        if (bytes > MAX_CAPTURE_BODY_CHARS) break;
+        text += decoder.decode(value, { stream: true });
+      }
+    } finally {
+      window.clearTimeout(timeout);
+      captureReaders.delete(reader);
+      void reader.cancel().catch(() => {});
+    }
   }
 
   function installFetchCapture() {
@@ -2660,14 +2716,7 @@
       const url = requestUrl(input);
       processModelPayload(init?.body);
       const response = await originalFetch.call(this, input, init);
-      const contentType = String(response?.headers?.get?.("content-type") || "");
-      if (response?.clone && (isLikelyUsageUrl(url) || /json|event-stream|text/.test(contentType))) {
-        response
-          .clone()
-          .text()
-          .then((text) => processCapturePayload(text, "fetch", url))
-          .catch(() => {});
-      }
+      void captureResponse(response, url).catch(() => {});
       return response;
     }
     wrappedFetch.__codexDailyTokenUsageWrapped = VERSION;
@@ -2686,7 +2735,7 @@
     };
     Xhr.prototype.send = function send(...args) {
       processModelPayload(args[0]);
-      this.addEventListener?.("loadend", () => {
+      listenForCapture(this, "loadend", () => {
         const url = this.__codexDailyTokenUsageUrl || "";
         if (!isLikelyUsageUrl(url) && !String(this.getResponseHeader?.("content-type") || "").match(/json|event-stream|text/)) {
           return;
@@ -2696,7 +2745,7 @@
         } catch {
           // Ignore unreadable XHR bodies.
         }
-      });
+      }, true);
       return originalSend.apply(this, args);
     };
     Xhr.prototype.__codexDailyTokenUsageOriginalOpen = originalOpen;
@@ -2709,7 +2758,7 @@
     const NativeWebSocket = window.WebSocket;
     function DailyTokenUsageWebSocket(...args) {
       const socket = new NativeWebSocket(...args);
-      socket.addEventListener?.("message", (event) => {
+      const removeMessage = listenForCapture(socket, "message", (event) => {
         try {
           if (typeof event.data === "string") {
             processCapturePayload(event.data, "websocket");
@@ -2720,6 +2769,7 @@
           // Keep socket delivery untouched.
         }
       });
+      listenForCapture(socket, "close", removeMessage, true);
       return socket;
     }
     try {
@@ -2736,29 +2786,11 @@
     window.WebSocket = DailyTokenUsageWebSocket;
   }
 
-  function installMessageCapture() {
-    if (window.__codexDailyTokenUsageMessageCapture === VERSION) return;
-    window.addEventListener?.(
-      "message",
-      (event) => {
-        try {
-          processModelPayload(event.data);
-          processCapturePayload(event.data, "post-message");
-        } catch {
-          // Ignore unrelated messages.
-        }
-      },
-      true
-    );
-    window.__codexDailyTokenUsageMessageCapture = VERSION;
-  }
-
   function installStandaloneCapture() {
     if (captureInstalled) return false;
     installFetchCapture();
     installXhrCapture();
     installWebSocketCapture();
-    installMessageCapture();
     captureInstalled = true;
     sourceMode = "standalone";
     return true;
@@ -2778,6 +2810,9 @@
       window.WebSocket = window.WebSocket.__codexDailyTokenUsageOriginal;
     }
     captureInstalled = false;
+    for (const cleanup of captureCleanups) cleanup();
+    for (const reader of captureReaders) void reader.cancel().catch(() => {});
+    captureReaders.clear();
   }
 
   function historyBackfillStatus() {
@@ -3134,42 +3169,58 @@
     );
   }
 
+  function findAppServices(moduleExports) {
+    for (const value of Object.values(moduleExports || {})) {
+      if (value && typeof value === "object" && typeof value.workspaceFiles?.read === "function" &&
+          typeof value.localThreadCatalog?.readEntries === "function") return value;
+    }
+    return null;
+  }
+
   async function resolveAppServices() {
     if (appServicesPromise) return appServicesPromise;
     appServicesPromise = (async () => {
-      const urls = collectLoadedAssetUrls().filter((url) => /\/assets\/rpc-[^/]+\.js(?:$|\?)/.test(url));
+      // 新版直接从 app-initial 导出服务，rpc facade 不一定已加载。
+      const urls = collectLoadedAssetUrls()
+        .filter((url) => /\/assets\/(?:rpc-|app-initial[-~]|app-main[-~])/.test(url))
+        .sort((a, b) => Number(!/\/rpc-/.test(a)) - Number(!/\/rpc-/.test(b)))
+        .slice(0, HISTORY_ASSET_SCAN_LIMIT);
       for (const url of urls) {
         try {
           const moduleExports = await import(/* @vite-ignore */ url);
-          if (moduleExports?.appServices?.workspaceFiles && moduleExports?.appServices?.localThreadCatalog) {
-            return moduleExports.appServices;
-          }
+          const services = findAppServices(moduleExports);
+          if (services) return services;
         } catch {
           // Try the next loaded RPC module.
         }
       }
       return null;
     })();
-    return appServicesPromise;
+    const services = await appServicesPromise;
+    if (!services) appServicesPromise = null;
+    return services;
   }
 
   async function listRecentWorkspaceSessionThreads() {
     const services = await resolveAppServices();
     const bootstrap = await window.electronBridge?.getInitialSidebarBootstrap?.();
     if (!services || !bootstrap) return [];
-    const ids = bootstrapThreadIds(bootstrap);
+    const ids = bootstrapThreadIds(bootstrap).slice(0, HISTORY_THREAD_SCAN_LIMIT);
     if (!ids.length) return [];
 
     const entriesById = new Map();
     for (const entry of bootstrap.catalogEntries || []) {
+      if (entry.hostId && entry.hostId !== "local" || entry.sourceKind === "chatgpt") continue;
       const id = threadIdentity(entry);
       if (id) entriesById.set(id, entry);
     }
     for (let offset = 0; offset < ids.length; offset += 100) {
       const refs = ids.slice(offset, offset + 100).map((threadId) => ({ hostId: "local", threadId }));
+      if (destroyed) return [];
       try {
         const entries = await services.localThreadCatalog.readEntries(refs);
         for (const entry of entries || []) {
+          if (entry.hostId && entry.hostId !== "local" || entry.sourceKind === "chatgpt") continue;
           const id = threadIdentity(entry);
           if (id) entriesById.set(id, entry);
         }
@@ -3190,7 +3241,9 @@
       })
       .map((entry) => {
         const id = threadIdentity(entry);
-        const sessionPaths = homes.map((home) => sessionPathFromThreadId(id, home)).filter(Boolean);
+        const sessionPaths = Array.from(new Set([
+          threadPath(entry), ...homes.map((home) => sessionPathFromThreadId(id, home)),
+        ].filter(Boolean)));
         return {
           ...entry,
           id,
@@ -3400,6 +3453,7 @@
           representation: "text",
           maxBytes: HISTORY_MAX_SESSION_BYTES,
         });
+        if (response?.truncated === true) throw new Error("session 文件超过历史回填大小上限");
         if (typeof response?.text === "string") return response.text;
       }
     } catch (error) {
@@ -3419,6 +3473,9 @@
       response?.content_base64 ||
       response?.data?.dataBase64 ||
       response?.data?.data_base64;
+    if (typeof dataBase64 === "string" && dataBase64.length > Math.ceil(HISTORY_MAX_SESSION_BYTES / 3) * 4) {
+      throw new Error("session 文件超过历史回填大小上限");
+    }
     return base64DecodeUtf8(dataBase64);
   }
 
@@ -3428,7 +3485,7 @@
     const workerCount = Math.max(1, Math.min(limit, items.length));
     await Promise.all(
       Array.from({ length: workerCount }, async () => {
-        while (index < items.length) {
+        while (!destroyed && index < items.length) {
           const current = index;
           index += 1;
           results[current] = await mapper(items[current], current);
@@ -3442,7 +3499,9 @@
     let lastError = null;
     for (const path of threadPaths(thread)) {
       try {
+        if (destroyed) return [];
         const text = await readSessionText(path);
+        if (destroyed) return [];
         return parseSessionUsagesFromJsonl(text, {
           path,
           threadId: threadIdentity(thread),
@@ -3469,6 +3528,7 @@
     render({ animate: false });
     try {
       const threads = await listRecentSessionThreads();
+      if (destroyed) return historyBackfillLastResult;
       const threadReadResults = await mapLimit(threads, HISTORY_READ_CONCURRENCY, async (thread) => {
         try {
           return { read: true, usages: await readThreadSessionUsages(thread) };
@@ -3477,6 +3537,7 @@
         }
       });
 
+      if (destroyed) return historyBackfillLastResult;
       let changed = false;
       let sessions = 0;
       let filesRead = 0;
@@ -3521,7 +3582,7 @@
       return historyBackfillLastResult;
     } finally {
       historyBackfillInFlight = false;
-      render({ animate: false });
+      if (!destroyed) render({ animate: false });
     }
   }
 
@@ -5463,6 +5524,12 @@
     observer?.disconnect();
     resizeObserver?.disconnect();
     restoreStandaloneCapture();
+    window.removeEventListener("codex-message-from-view", handleViewMessage, true);
+    window.removeEventListener("message", handleHostMessage, true);
+    window.removeEventListener("codex-plus-user-scripts-cleanup", destroy);
+    document.removeEventListener("DOMContentLoaded", start);
+    modelByConversationKey.clear();
+    clearDaySnapshotCache();
     document.removeEventListener("pointerdown", handleDocumentPointerDown, true);
     window.removeEventListener("resize", handleWindowResize);
     root?.remove();
@@ -5522,6 +5589,8 @@
       bootstrapHomeDirectories,
       sessionPathFromThreadId,
       resolveAppServices,
+      findAppServices,
+      captureResponse,
       listRecentWorkspaceSessionThreads,
       cumulativeUsageDelta,
       parseSessionUsagesFromJsonl,
@@ -5571,7 +5640,9 @@
   };
 
   window[API_KEY] = api;
+  window.__codexPlusUserScripts?.registerCleanup?.(destroy);
   installModelCapture();
+  window.addEventListener("codex-plus-user-scripts-cleanup", destroy);
 
   function start() {
     if (destroyed) return;
